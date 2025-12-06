@@ -7,7 +7,7 @@ async function fetchGitHubData(username) {
     "Content-Type": "application/json",
   };
 
-  // GraphQL query to get contribution data
+  // GraphQL query to get contribution data AND language stats
   const query = `
     query($username: String!) {
       user(login: $username) {
@@ -18,6 +18,19 @@ async function fetchGitHubData(username) {
               contributionDays {
                 contributionCount
                 date
+              }
+            }
+          }
+        }
+        repositories(first: 100, ownerAffiliations: OWNER, orderBy: {field: UPDATED_AT, direction: DESC}) {
+          nodes {
+            languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+              edges {
+                size
+                node {
+                  name
+                  color
+                }
               }
             }
           }
@@ -42,7 +55,44 @@ async function fetchGitHubData(username) {
     throw new Error(data.errors[0].message);
   }
 
-  return data.data.user.contributionsCollection.contributionCalendar;
+  return {
+    calendar: data.data.user.contributionsCollection.contributionCalendar,
+    repositories: data.data.user.repositories.nodes,
+  };
+}
+
+function calculateLanguageStats(repositories) {
+  const languageMap = {};
+
+  repositories.forEach((repo) => {
+    repo.languages.edges.forEach((edge) => {
+      const { name, color } = edge.node;
+      const size = edge.size;
+
+      if (languageMap[name]) {
+        languageMap[name].size += size;
+      } else {
+        languageMap[name] = { size, color: color || "#858585" };
+      }
+    });
+  });
+
+  const totalSize = Object.values(languageMap).reduce(
+    (sum, lang) => sum + lang.size,
+    0
+  );
+
+  const languages = Object.entries(languageMap)
+    .map(([name, data]) => ({
+      name,
+      color: data.color,
+      percentage: ((data.size / totalSize) * 100).toFixed(2),
+      size: data.size,
+    }))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, 5);
+
+  return languages;
 }
 
 function calculateStreaks(weeks) {
@@ -56,7 +106,6 @@ function calculateStreaks(weeks) {
   let longestEnd = null;
   let tempStart = null;
 
-  // Go backwards from most recent day
   for (let i = allDays.length - 1; i >= 0; i--) {
     const day = allDays[i];
 
@@ -64,12 +113,10 @@ function calculateStreaks(weeks) {
       tempStreak++;
       if (!tempStart) tempStart = day.date;
 
-      // Current streak only counts if it's continuous from today
       if (i === allDays.length - 1 || currentStreak > 0) {
         currentStreak = tempStreak;
       }
 
-      // Track longest streak
       if (tempStreak > longestStreak) {
         longestStreak = tempStreak;
         longestStart = day.date;
@@ -103,9 +150,9 @@ function formatDate(dateStr) {
   });
 }
 
-function generateSVG(totalContributions, streaks, activityDays) {
+function generateSVG(totalContributions, streaks, activityDays, languages) {
   const width = 800;
-  const height = 500;
+  const height = 720;
   const graphWidth = 700;
   const graphHeight = 100;
   const padding = 20;
@@ -135,6 +182,38 @@ function generateSVG(totalContributions, streaks, activityDays) {
   const startDate = formatDate(streaks.longestStart);
   const endDate = formatDate(streaks.longestEnd);
 
+  // Generate language bar segments
+  let currentX = 0;
+  const languageBarSegments = languages
+    .map((lang) => {
+      const segmentWidth = (parseFloat(lang.percentage) / 100) * 760;
+      const segment = `<rect x="${
+        currentX + 20
+      }" y="530" width="${segmentWidth}" height="20" fill="${
+        lang.color
+      }" rx="4"/>`;
+      currentX += segmentWidth;
+      return segment;
+    })
+    .join("");
+
+  // Generate language list
+  const languageList = languages
+    .map((lang, index) => {
+      const row = Math.floor(index / 2);
+      const col = index % 2;
+      const x = col === 0 ? 80 : 450;
+      const y = 590 + row * 50;
+
+      return `
+        <circle cx="${x - 30}" cy="${y}" r="8" fill="${lang.color}"/>
+        <text x="${x}" y="${y + 5}" class="text lang-name">${lang.name} ${
+        lang.percentage
+      }%</text>
+      `;
+    })
+    .join("");
+
   return `
 <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
   <style>
@@ -151,13 +230,13 @@ function generateSVG(totalContributions, streaks, activityDays) {
     .stat-number { font-size: 48px; font-weight: bold; }
     .stat-label { font-size: 16px; }
     .stat-detail { font-size: 12px; opacity: 0.7; }
+    .lang-name { font-size: 16px; }
     .accent { fill: #f85149; }
     .blue { fill: #58a6ff; }
     .graph-line { stroke: #3fb950; stroke-width: 2; fill: none; }
     .graph-area { fill: #3fb95033; }
   </style>
   
-  <!-- Background -->
   <rect width="${width}" height="${height}" class="bg" rx="10"/>
   
   <!-- Stats Container -->
@@ -168,8 +247,9 @@ function generateSVG(totalContributions, streaks, activityDays) {
   <text x="140" y="105" class="accent stat-label" text-anchor="middle">Total Contributions</text>
   <text x="140" y="130" class="text stat-detail" text-anchor="middle">Oct 12, 2020 - Present</text>
   
-  <!-- Current Streak -->
+  <!-- Current Streak with flame icon -->
   <circle cx="400" cy="70" r="45" class="accent" opacity="0.2"/>
+  <path d="M 400 45 Q 400 40 405 40 L 405 35 Q 405 30 400 30 Q 395 30 395 35 L 395 40 Q 395 40 400 45 Z" class="accent" transform="translate(0, 5)"/>
   <text x="400" y="80" class="text stat-number" text-anchor="middle">${
     streaks.current
   }</text>
@@ -204,29 +284,48 @@ function generateSVG(totalContributions, streaks, activityDays) {
     graphHeight - padding
   }" class="border" stroke-width="1"/>
   </g>
+  
+  <!-- Languages Container -->
+  <rect x="10" y="340" width="780" height="360" fill="none" class="border" stroke-width="2" rx="8"/>
+  
+  <!-- Languages Title -->
+  <text x="400" y="380" class="accent" font-size="32" font-weight="bold" text-anchor="middle">Most Used Languages</text>
+  
+  <!-- Language Bar -->
+  <g transform="translate(0, 120)">
+    ${languageBarSegments}
+  </g>
+  
+  <!-- Language List -->
+  <g>
+    ${languageList}
+  </g>
 </svg>
   `.trim();
 }
 
 module.exports = async (req, res) => {
   try {
-    const { username, theme } = req.query;
+    const { username } = req.query;
 
     if (!username) {
       return res.status(400).send("Username parameter is required");
     }
 
-    // Fetch data from GitHub
-    const calendar = await fetchGitHubData(username);
+    const { calendar, repositories } = await fetchGitHubData(username);
     const streaks = calculateStreaks(calendar.weeks);
     const activityDays = getLast90Days(calendar.weeks);
+    const languages = calculateLanguageStats(repositories);
 
-    // Generate SVG
-    const svg = generateSVG(calendar.totalContributions, streaks, activityDays);
+    const svg = generateSVG(
+      calendar.totalContributions,
+      streaks,
+      activityDays,
+      languages
+    );
 
-    // Set response headers
     res.setHeader("Content-Type", "image/svg+xml");
-    res.setHeader("Cache-Control", "public, max-age=14400"); // Cache for 4 hours
+    res.setHeader("Cache-Control", "public, max-age=14400");
     res.status(200).send(svg);
   } catch (error) {
     console.error("Error generating stats:", error.message);
